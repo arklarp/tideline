@@ -1,124 +1,118 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// The course: a fixed sequence of masts to swing from, thirteen sparks strung between them, the
+// rising flood and the beacon at the end. Everything is generated from one seed, so the city the
+// player sees in a screenshot is the city they will meet when they play.
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import { COURSE, TIDE, PALETTE } from './config.js';
+import { makeRng } from './random.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+export class World {
+  constructor(seed) {
+    this.seed = seed;
+    const rng = makeRng(seed);
+    this.anchors = [];
+    this.sparks = [];
+    this.beacon = { x: COURSE.length, y: 300 };
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
+    let x = COURSE.firstAnchor;
+    let y = 300;
+    while (x < COURSE.length - 260) {
+      const drift = rng.range(-150, 150);
+      y = Math.min(COURSE.anchorHeight[1], Math.max(COURSE.anchorHeight[0], y + drift));
+      this.anchors.push({
+        x,
+        y,
+        hue: rng.pick(PALETTE.neon),
+        pulse: rng.range(0, Math.PI * 2),
+        height: rng.range(60, 150),
+      });
+      x += rng.range(COURSE.anchorGap[0], COURSE.anchorGap[1]);
+    }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+    const span = (this.anchors[this.anchors.length - 1].x - COURSE.firstAnchor) / (COURSE.sparks + 1);
+    for (let i = 1; i <= COURSE.sparks; i += 1) {
+      const sx = COURSE.firstAnchor + span * i;
+      const near = this.anchorNear(sx);
+      this.sparks.push({
+        x: sx,
+        y: Math.min(TIDE.start - 150, near.y + rng.range(90, 200)),
+        taken: false,
+        phase: rng.range(0, Math.PI * 2),
+        spin: rng.range(-1.6, 1.6),
+      });
+    }
+
+    this.waterY = TIDE.start;
+    this.time = 0;
+    this.taken = 0;
+    this.camera = { x: COURSE.startX - 480, y: 300 };
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+  anchorNear(x) {
+    let best = this.anchors[0];
+    let bestGap = Infinity;
+    for (const anchor of this.anchors) {
+      const gap = Math.abs(anchor.x - x);
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = anchor;
+      }
+    }
+    return best;
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
+  // A mast worth throwing at: inside reach, not the one we just left, and not straight below.
+  findAnchor(player, reach) {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const anchor of this.anchors) {
+      const dx = anchor.x - player.x;
+      const dy = anchor.y - player.y;
+      if (dx < -40) continue;
+      const distance = Math.hypot(dx, dy);
+      if (distance > reach || distance < 40) continue;
+      const score = dx * 1.1 - Math.abs(dy) * 0.35 - distance * 0.25;
+      if (score > bestScore) {
+        bestScore = score;
+        best = anchor;
+      }
+    }
+    return best;
+  }
+
+  update(dt, player) {
+    this.time += dt;
+    const target = TIDE.start - this.taken * TIDE.perSpark + this.time * TIDE.creep;
+    this.waterY = Math.max(this.waterY, target);
+
+    // Camera: keeps the pilot a third in from the left, low enough that the flood stays in shot.
+    const wantX = player.x - 520;
+    const wantY = Math.min(400, Math.max(-140, player.y - 340));
+    this.camera.x += (wantX - this.camera.x) * Math.min(1, dt * 5.5);
+    this.camera.y += (wantY - this.camera.y) * Math.min(1, dt * 3.2);
+  }
+
+  // Returns the spark the pilot just swallowed, if any.
+  collect(player) {
+    for (const spark of this.sparks) {
+      if (spark.taken) continue;
+      if (Math.hypot(spark.x - player.x, spark.y - player.y) < 52) {
+        spark.taken = true;
+        this.taken += 1;
+        return spark;
+      }
+    }
     return null;
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  drowned(player) {
+    return player.y > this.waterY - 12;
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  reachedBeacon(player) {
+    return player.x > this.beacon.x - 90;
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
+  progress(player) {
+    return Math.min(1, Math.max(0, (player.x - COURSE.startX) / (this.beacon.x - COURSE.startX)));
   }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
-    }
-    return events;
-  }
-
-  reset();
-  return { state, reset, step };
 }

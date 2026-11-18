@@ -1,79 +1,123 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshots that ship with the entry are taken from the running game: this module sets a
+// deterministic autopilot loose for a fixed number of frames, then freezes the frame. One seed in,
+// the same three images out, every time.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { PALETTE } from './config.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+const FIXED = 1 / 60;
+
+// A simple pilot: throw the line whenever it is free, let it go when it has carried the swing
+// above its mast. It is not good at the game, which is exactly what a screenshot needs.
+function autopilot(input, player, world) {
+  let previous = input.held;
+  if (player.rope) {
+    input.held = player.y > player.rope.anchor.y + 70;
+  } else {
+    input.held = Boolean(world.findAnchor(player, 520));
   }
-  return Infinity;
+  input.justPressed = input.held && !previous;
+  input.justReleased = !input.held && previous;
+  input.axis = 0;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+function advance(context, frames, options = {}) {
+  const { state, world, player, effects, step, input } = context;
+  for (let i = 0; i < frames; i += 1) {
+    autopilot(input, player, world);
+    step(FIXED);
+    // Keep the staging frames alive: the tide is held down so a stray frame never ends the shot.
+    if (options.holdTide) world.waterY = Math.min(world.waterY, options.holdTide);
+    if (state.screen !== 'play' && options.keepPlaying) {
+      state.screen = 'play';
+      player.alive = true;
     }
+    if (state.time > 400) break;
   }
-  return best;
+  input.endFrame();
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function stageShot(name, context) {
+  const { state, world, player, effects, step, draw, input, renderer } = context;
+  state.time = 0;
+  effects.shake = 0;
+
+  if (name === 'start') {
+    advance(context, 90, { keepPlaying: false });
+    state.screen = 'title';
+    draw();
+    return;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'play') {
+    state.screen = 'play';
+    state.startedAt = 0;
+    // Run the autopilot until it is mid-swing with a full trail and a few sparks taken: that is
+    // the frame that shows the game best, and the same seed always stops on the same frame.
+    for (let i = 0; i < 1500; i += 1) {
+      autopilot(input, player, world);
+      step(FIXED);
+      world.waterY = Math.min(world.waterY, 700);
+      if (state.screen !== 'play') {
+        state.screen = 'play';
+        player.alive = true;
+      }
+      const screenY = player.y - world.camera.y;
+      const ready = player.rope
+        && player.trail.length > 24
+        && world.taken >= 4
+        && screenY > 120
+        && screenY < 420
+        && player.x - world.camera.x > 260
+        && player.x - world.camera.x < 760;
+      if (ready) {
+        draw();
+        return;
+      }
+    }
+    draw();
+    return;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'win') {
+    state.screen = 'play';
+    for (const spark of world.sparks) spark.taken = true;
+    world.taken = world.sparks.length;
+    player.x = world.beacon.x - 210;
+    player.y = 296;
+    player.vx = 520;
+    player.vy = -240;
+    player.rope = null;
+    player.alive = true;
+    player.strokes = 24;
+    player.trail = [];
+    for (let i = 0; i < 34; i += 1) {
+      player.trail.push({
+        x: player.x - i * 17,
+        y: player.y + 40 - Math.sin(i * 0.32) * 70 - i * 1.6,
+      });
+    }
+    world.camera.x = player.x - 700;
+    world.camera.y = -70;
+    state.lit = 1;
+    // The beam's sweep is a function of time: this value parks it on a dramatic diagonal.
+    state.time = 114;
+    state.startedAt = 39.8;
+    effects.burst(world.beacon.x, 220, '#ffe9a8', 46, 300);
+    state.screen = 'win';
+    draw();
+    return;
+  }
+
+  // The last shot: the tide at the pilot's heels.
+  state.screen = 'play';
+  advance(context, 300, { holdTide: 690 });
+  world.waterY = player.y + 34;
+  effects.splash(player.x + 90, world.waterY);
+  effects.shake = 0.7;
+  state.screen = 'lose';
+  state.startedAt = 0;
+  state.time = 51.6;
+  state.lit = world.taken / world.sparks.length;
+  draw();
+  void PALETTE;
 }

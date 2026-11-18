@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Block Dodger</title>
+<title>TIDELINE — relight the last lighthouse</title>
+<meta name="description" content="TIDELINE: swing a glowing tether across a drowning neon city, gather sparks and relight the last lighthouse before the tide takes you.">
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11141b; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  /* Read aloud, never shown: the status line screen readers announce. */
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #07060f; }
+  canvas#game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Block Dodger: move the paddle left and right to dodge falling blocks and catch coins"></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<canvas id="game" aria-label="TIDELINE: hold the mouse button or space to throw a tether to the next mast and swing, release to fly. Gather thirteen sparks to relight the lighthouse before the tide reaches you."></canvas>
+<p id="status" class="sr" role="status" aria-live="polite"></p>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

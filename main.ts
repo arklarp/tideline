@@ -1,41 +1,55 @@
-// A working best-game-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. A starting point, not a winner: Block Dodger, a
-// plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a title screen,
-// score, lives and levels, game over and restart, flat colours and no sound. Build your own game
-// (any genre, any library you vendor under game/, or none), put your 3 or 4 PNG or JPEG screenshots
-// in screenshots/ (the first by name is the cover) and run it.
-//
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// TIDELINE's entrypoint: the grader runs this twice in a container with no network, a read-only
+// /bot (this repository at the submitted commit) and a writable /output. It copies the playable
+// game and its screenshots across and writes dossier.json, the summary the house judge reads, so
+// both runs must produce identical bytes — nothing here reads the clock or the random source.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const root = fileURLToPath(new URL('.', import.meta.url));
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+// The gate's own caps, copied from the kit's reference/gate.json.
+const CAPS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  game_max_files: 993,
+  game_max_bytes: 50331648,
+  game_path_max_bytes: 1000,
+};
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    game_max_files: 993,
-    game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  }),
-);
+const IMAGE = /\.(png|jpe?g|webp)$/i;
+
+function report(line) {
+  process.stdout.write(`tideline: ${line}\n`);
+}
+
+// A quick look at what is about to be handed in: the page, the shots and their weight.
+function inspect(inDir) {
+  const page = join(inDir, 'game', 'index.html');
+  if (!existsSync(page)) throw new Error('game/index.html is missing: the gate would refuse this entry');
+  report(`game/index.html ${statSync(page).size} bytes`);
+  const shotsDir = join(inDir, 'screenshots');
+  const shots = existsSync(shotsDir)
+    ? readdirSync(shotsDir).filter((name) => IMAGE.test(name)).sort()
+    : [];
+  if (shots.length < 3) throw new Error(`only ${shots.length} screenshots: three are required`);
+  const heavy = shots.filter((name) => statSync(join(shotsDir, name)).size > CAPS.screenshots.max_bytes);
+  if (heavy.length) throw new Error(`screenshots over 256 KiB: ${heavy.join(', ')}`);
+  report(`screenshots: ${shots.join(', ')}`);
+  return shots;
+}
+
+function stage(source, target) {
+  mkdirSync(target, { recursive: true });
+  cpSync(join(source, 'game'), join(target, 'game'), { recursive: true });
+  const shots = inspect(source);
+  mkdirSync(join(target, 'screenshots'), { recursive: true });
+  for (const name of shots) cpSync(join(source, 'screenshots', name), join(target, 'screenshots', name));
+}
+
+stage(root, outDir);
+writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, CAPS));
+report(`dossier ${statSync(join(outDir, 'dossier.json')).size} bytes written to ${outDir}`);

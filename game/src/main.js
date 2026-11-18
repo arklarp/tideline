@@ -1,134 +1,155 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// TIDELINE — the loop. One canvas, four screens (title, play, win, lose), a fixed seed for the
+// city and a small screenshot harness so the three shots that ship with the entry are taken from
+// the real game rather than mocked up.
+
+import { World } from './world.js';
+import { Player } from './player.js';
+import { Renderer } from './render.js';
+import { Input } from './input.js';
+import { Sound } from './audio.js';
+import { Effects } from './effects.js';
+import { buildCity } from './city.js';
+import { makeRng } from './random.js';
+import { TIDE } from './config.js';
+import { drawHud, drawTitle, drawEnd } from './hud.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
 const params = new URLSearchParams(window.location.search);
+const seed = Number(params.get('seed') || 7) || 7;
 const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const world = new World(seed);
+const player = new Player();
+const renderer = new Renderer(canvas);
+const effects = new Effects(seed);
+const input = new Input(canvas);
+const sound = new Sound();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+world.citySeed = seed;
+renderer.setCity(buildCity(makeRng(seed ^ 0x2545f491)));
+
+const state = {
+  world,
+  player,
+  effects,
+  time: 0,
+  startedAt: 0,
+  screen: 'title',
+  lit: 0,
+  streak: 0,
+  message: '',
+};
+
+function announce(text) {
+  if (status && status.textContent !== text) status.textContent = text;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function start() {
+  sound.unlock();
+  player.reset();
+  world.waterY = TIDE.start;
+  world.taken = 0;
+  world.time = 0;
+  for (const spark of world.sparks) spark.taken = false;
+  state.startedAt = state.time;
+  state.screen = 'play';
+  state.lit = 0;
+  state.streak = 0;
+  effects.bits.length = 0;
+  announce('Run started. Thirteen sparks to the beacon.');
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
+function step(dt) {
+  state.time += dt;
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  if (state.screen === 'title') {
+    world.update(dt, player);
+    effects.update(dt);
+    if (input.anyKey || input.justPressed) start();
+    return;
   }
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
+  if (state.screen === 'play') {
+    player.update(dt, input, world);
+    world.update(dt, player);
+    effects.update(dt);
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+    const spark = world.collect(player);
+    if (spark) {
+      state.streak += 1;
+      effects.burst(spark.x, spark.y, '#ffe9a8', 26, 260);
+      sound.spark(state.streak);
+      announce(`Spark ${world.taken} of ${world.sparks.length}.`);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
+    if (world.taken > 0 && Math.random() < 0.06) state.streak = Math.max(0, state.streak - 1);
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
+    state.lit = world.taken / world.sparks.length;
+    sound.setTension(Math.max(0, 1 - (world.waterY - player.y) / 420));
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+    if (player.rope && input.justPressed) sound.throwRope();
+    if (input.justReleased && player.strokes > 0) sound.release();
+
+    if (world.drowned(player)) {
+      player.alive = false;
+      effects.splash(player.x, world.waterY);
+      sound.splash();
+      state.screen = 'lose';
+      announce('The tide took you.');
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    if (world.reachedBeacon(player)) {
+      state.lit = 1;
+      sound.win();
+      state.screen = 'win';
+      effects.burst(world.beacon.x, world.beacon.y, '#ffe9a8', 60, 420);
+      announce('The beam holds. The lighthouse burns again.');
+      return;
+    }
+    if (input.restart) start();
+    return;
   }
 
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
+  // Win and lose screens keep the sky moving, so the last frame is never a still.
+  world.update(dt * 0.5, player);
+  effects.update(dt);
+  if (input.restart) start();
+}
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
+function draw() {
+  renderer.draw({
+    world,
+    player,
+    effects,
+    time: state.time,
+    shake: effects.shake,
+    lit: state.lit,
   });
+  if (state.screen === 'title') drawTitle(renderer.ctx, state, renderer.view);
+  else if (state.screen === 'play') drawHud(renderer.ctx, state, renderer.view);
+  else drawEnd(renderer.ctx, state, renderer.view);
+}
 
-  announce('Block Dodger. Press Space or click to start.');
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.034, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  step(dt);
+  draw();
+  input.endFrame();
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+window.addEventListener('resize', () => renderer.resize());
+
+// A read-only handle for play-testing and the screenshot harness: the live state, for probes.
+window.__tideline = { state, world, player, renderer };
+
+// Screenshot staging: ?shot=start|play|win|lose&seed=N sets a deterministic frame and stops the
+// clock, so the three images in screenshots/ are the game itself, captured in a browser.
+if (shot) {
+  stageShot(shot, { state, world, player, effects, step, draw, input, renderer });
+} else {
+  requestAnimationFrame(frame);
+}
